@@ -1,0 +1,197 @@
+# -*- coding: utf-8 -*-
+"""
+@File   : parser/hebei_ggfwpt.py
+@Author :dong bao
+@Date   :2020/1/26
+@Description : 河北公共资源交易服务平台 parser
+"""
+
+import os
+import re
+import json
+import scrapy
+from math import ceil
+from scrapy.http import TextResponse
+from mimetypes import guess_extension
+from urllib.parse import unquote
+from ConstructionIndustrySpider.items.hebei_ggfwpt import *
+
+
+allowed_domains = ['www.hebpr.gov.cn', 'www.hebpr.cn']
+
+
+def hebei_ggfwpt_parse(self, response):
+    domain_priority = response.meta['domain_priority']
+
+    # 请求通知公告列表首页
+    for notice_id in ['001001', '001002']:
+        yield response.follow(url='/hbggfwpt/tzgg/'+notice_id+'/notice.html',
+                              callback=self.hebei_ggfwpt_parse_notice_list, dont_filter=True,
+                              priority=domain_priority, cb_kwargs={'domain_priority': domain_priority})
+
+    # 请求政策法规、升级文件、政策解读列表首页
+    for num in ['002004001', '002004002', '002005']:
+        params = {
+            "siteGuid": "645ad4ac-16b3-47d8-95bc-294a9052c6a2", "code": "", "keyword": "", "txtname": "",
+            "categoryNum": num, "pageIndex": 0, "pageSize": 15, "starttime": "", "endtime": ""
+        }
+        yield scrapy.FormRequest(url='http://www.hebpr.gov.cn/EWB-FRONT/rest/GgSearchAction/getMenhuInfoMationList',
+                                 callback=self.hebei_ggfwpt_parse_policy_list,
+                                 dont_filter=True, priority=domain_priority,
+                                 cb_kwargs={'domain_priority': domain_priority, 'params': params},
+                                 formdata={'params': json.dumps(params)})
+
+    # 交易大厅 1-49 页
+    url = 'http://www.hebpr.gov.cn/inteligentsearch/rest/inteligentSearch/getFullTextData'
+    link_list = ['1300', '1301', '1307', '1303', '1302', '1310', '1306',
+                 '1309', '1311', '1305', '1304', '139001', '139002', '1308']
+    for link in link_list:
+        for page in range(49):
+            post_params = {
+                "token": "", "pn": page*10, "rn": 10, "sdt": "", "edt": "", "wd": "", "inc_wd": "", "exc_wd": "",
+                "fields": "title", "cnum": "001", "sort": "{\"webdate\":0}", "ssort": "title", "cl": 200,
+                "terminal": "", "time": None, "highlights": "title", "statistics": None, "unionCondition": None,
+                "accuracy": "", "noParticiple": "0", "searchRange": None, "isBusiness": "1",
+                "condition": [
+                    {
+                        "fieldName": "categorynum", "equal": "003001", "notEqual": None, "equalList": None,
+                        "notEqualList": None, "isLike": True, "likeType": 2
+                    },
+                    {
+                        "fieldName": "infoc", "equal": link, "notEqual": None, "equalList": None,
+                        "notEqualList": None, "isLike": True, "likeType": 2
+                    }
+                ]
+            }
+            yield scrapy.Request(method='POST', url=url, body=json.dumps(post_params),
+                                 headers={'Content-Type': 'text/plain'}, dont_filter=True,
+                                 callback=self.hebei_ggfwpt_parse_deal_list, priority=domain_priority,
+                                 cb_kwargs={'domain_priority': domain_priority})
+
+
+# 通知公告列表
+def hebei_ggfwpt_parse_notice_list(self, response, domain_priority):
+    if 'notice.html' in response.request.url:
+        page_script = response.css('#page+script::text').get()
+        total = int(re.search(r"total: (\d+),", page_script).group(1))
+        for page in range(2, min(ceil(total / 5) + 1, 41)):
+            yield response.follow(url=response.request.url.replace('notice', str(page)),
+                                  callback=self.hebei_ggfwpt_parse_notice_list, dont_filter=True,
+                                  priority=domain_priority, cb_kwargs={'domain_priority': domain_priority})
+
+    for notice in response.css('.ewb-news-mod'):
+        href = notice.css('a::attr(href)').get()
+        if not href.endswith('.html'):
+            href = href.replace('/hbggfwpt/', '/hbggfwpt_nas/')
+        item = HebeiGgfwptNoticeItem(title=notice.css('a ::text').get(),
+                                     source=notice.css('span::text').get()[5:],
+                                     date=notice.css('.ewb-intro-r::text').get())
+        yield response.follow(url=href, callback=self.hebei_ggfwpt_parse_notice_detail,
+                              priority=domain_priority, cb_kwargs={'domain_priority': domain_priority, 'item': item})
+
+
+# 通知公告详情
+def hebei_ggfwpt_parse_notice_detail(self, response, domain_priority, item):
+    item['url'] = response.request.url
+    if not isinstance(response, TextResponse):
+        path = 'hebei_ggfwpt/files' + unquote(response.request.url[36:])
+        extension = guess_extension(response.headers['Content-Type'].decode())
+        item['raw_data'] = ''
+        item['content'] = ''
+        item['files'].append({'url': response.request.url, 'filename': item['title'] + extension, 'path': path})
+        yield item
+        yield self.download_file(response, path)
+    else:
+        item['raw_data'] = response.css('.ewb-shade').extract_first()
+        item['content'] = response.css('.ewb-copy').extract_first()
+
+        for img in response.css('.ewb-copy img'):
+            url = response.urljoin(img.css('::attr(src)').get())
+            if '/hbggfwpt/' not in url and '/uploadfile/' not in url:
+                path = 'hebei_ggfwpt/images' + img.css('::attr(src)').get().partition('hbggfwpt_nas')[-1]
+                item['images'].append({'url': url, 'path': path})
+                yield scrapy.Request(url=url, callback=self.download_file, cb_kwargs={'path': path}, priority=domain_priority)
+
+        for a in response.css('.ewb-file a#attachName'):
+            url = response.urljoin(a.css('::attr(href)').get())
+            path = 'hebei_ggfwpt/files' + a.css('::attr(href)').get()[13:]
+            filename = a.css('::attr(title)').get()
+            item['files'].append({'url': url, 'filename': filename, 'path': path})
+            yield scrapy.Request(url=url, callback=self.download_file, cb_kwargs={'path': path}, priority=domain_priority)
+
+        yield item
+
+
+# 政策文件列表
+def hebei_ggfwpt_parse_policy_list(self, response, domain_priority, **kwargs):
+    data = json.loads(response.text)
+    total = data['RowCount']
+    page_size = data['PageSize']
+    policies = data['Table']
+
+    if data['PageIndex'] == 0:
+        params = kwargs['params']
+        for page in range(1, ceil(total/page_size)):
+            params['pageIndex'] = page
+            yield scrapy.FormRequest(url=response.request.url, callback=self.hebei_ggfwpt_parse_policy_list,
+                                     formdata={'params': json.dumps(params)}, dont_filter=True,
+                                     priority=domain_priority, cb_kwargs={'domain_priority': domain_priority})
+
+    for policy in policies:
+        item = HebeiGgfwptPolicyItem(title=policy['title'], date=policy['infodate'])
+        yield response.follow(url=policy['infourl'], callback=self.hebei_ggfwpt_parse_policy_detail,
+                              priority=domain_priority, cb_kwargs={'domain_priority': domain_priority, 'item': item})
+
+
+# 政策文件详情
+def hebei_ggfwpt_parse_policy_detail(self, response, domain_priority, item):
+    item['url'] = response.request.url
+    if not isinstance(response, TextResponse):
+        path = 'hebei_ggfwpt/files' + unquote(item['url'][30:])
+        extension = guess_extension(response.headers['Content-Type'].decode())
+        item['raw_data'] = ''
+        item['content'] = ''
+        item['files'].append({'url': response.request.url, 'filename': item['title']+extension, 'path': path})
+        yield item
+        yield self.download_file(response, path)
+    else:
+        item['raw_data'] = response.css('.ewb-info').extract()[-1]
+        item['content'] = response.css('.article').extract_first()
+
+        for img in response.xpath('//*[@class="article"]//img[not(@height="1" or contains(@src, "/icon16/"))]'):
+            src = img.css('::attr(src)').get()
+            path = 'hebei_ggfwpt/images'
+            if src.startswith('/frame'):
+                path += '/' + os.path.basename(item['url'])[:-5] + '/' + os.path.basename(src)
+            elif src.startswith('/hbmhwz'):
+                path += src[7:]
+            url = response.urljoin(src)
+            item['images'].append({'url': url, 'path': path})
+            yield scrapy.Request(url=url, callback=self.download_file, cb_kwargs={'path': path}, priority=domain_priority)
+
+        for a in response.css('.ewb-file a#attachName'):
+            url = response.urljoin(a.css('::attr(href)').get())
+            filename = a.css('::attr(title)').get()
+            path = 'hebei_ggfwpt/files' + url[30:]
+            item['files'].append({'url': url, 'filename': filename, 'path': path})
+            yield scrapy.Request(url=url, callback=self.download_file, cb_kwargs={'path': path}, priority=domain_priority)
+
+        yield item
+
+
+# 交易大厅公告列表
+def hebei_ggfwpt_parse_deal_list(self, response, domain_priority):
+    records = json.loads(response.text)['result']['records']
+    for row in records:
+        url = response.urljoin('/hbggfwpt' + row['linkurl'])
+        item = HebeiGgfwptDealItem(url=url, id=row['id'], category=row['categoryname'], source=row['infod'],
+                                   title=row['title'], date=row['webdate'][:10], type=row['catename'])
+        yield scrapy.Request(url=url, callback=self.hebei_ggfwpt_parse_deal_detail,
+                             cb_kwargs={'item': item}, priority=domain_priority)
+
+
+# 交易大厅公告详情
+def hebei_ggfwpt_parse_deal_detail(self, response, item):
+    item['raw_data'] = response.css('.ewb-main').extract_first()
+    item['content'] = response.css('.ewb-copy').extract_first()
+    yield item
