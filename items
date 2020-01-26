@@ -1,0 +1,19 @@
+# -*- coding: utf-8 -*-
+from scrapy import Item, Field
+
+
+class BasicItem(Item):
+    url = Field()
+    raw_data = Field()
+    last_updated = Field()
+    last_crawled = Field()
+    collection = Field()
+
+
+class FileItem(Item):
+    url = Field()
+    data = Field()
+    path = Field()
+
+    def __repr__(self):
+        return self['url']
